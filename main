@@ -1,0 +1,208 @@
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.metrics import accuracy_score, classification_report
+
+def aspect_ratio_resize_and_top_crop(image, target_size=(256, 256)):
+    old_size = image.shape[:2]  # (height, width)
+
+    # Calculate the resize ratio based on the smaller dimension
+    ratio = target_size[0] / old_size[0] if old_size[0] < old_size[1] else target_size[1] / old_size[1]
+    new_size = (int(old_size[1] * ratio), int(old_size[0] * ratio))  # (width, height)
+
+    # Resize the image while keeping the aspect ratio
+    resized_image = cv2.resize(image, new_size)
+
+    # Ensure the resized image is larger than or equal to the target size before cropping
+    if resized_image.shape[0] < target_size[0] or resized_image.shape[1] < target_size[1]:
+        resized_image = cv2.resize(resized_image, target_size)
+
+    # Crop from the top
+    crop_y = 0  # Start cropping from the top
+    crop_x = 0 if resized_image.shape[1] <= target_size[1] else (resized_image.shape[1] - target_size[1]) // 2  # Center horizontally
+
+    cropped_image = resized_image[crop_y:crop_y + target_size[0], crop_x:crop_x + target_size[1]]
+
+    # Ensure that the cropped image is exactly target size (256, 256)
+    if cropped_image.shape != target_size:
+        cropped_image = cv2.resize(cropped_image, target_size)
+
+    return cropped_image
+
+class ImageDataset(Dataset):
+    def __init__(self, folder):
+        self.images = []
+        # Sort the filenames in the folder
+        filenames = sorted(os.listdir(folder))
+        for filename in filenames:
+            img = cv2.imread(os.path.join(folder, filename), 0)
+            if img is not None:
+                edges = cv2.Canny(img, 50, 150)
+                edges = cv2.resize(edges,(256,256))
+                #edges = aspect_ratio_resize_and_top_crop(edges)
+                edges = edges / 255.0
+                self.images.append(edges)
+        self.images = np.array(self.images)
+        self.images = np.expand_dims(self.images, axis=1)  # Add channel dimension
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        return torch.tensor(self.images[idx], dtype=torch.float32)
+
+class Autoencoder(nn.Module):
+    def __init__(self):
+        super(Autoencoder, self).__init__()
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2, padding=0),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2, padding=0),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2, padding=0)
+        )
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), 
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1),  #nn.Conv2d(64, 1, kernel_size=3, padding=1),  
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(64, 1, kernel_size=3, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+
+# Load images from both classes
+class0_dataset = ImageDataset('C:\\Users\\User\\my_pathetic_python\\20240925CNNautoencoder\\data\\cat\\double\\class0')
+class1_dataset = ImageDataset('C:\\Users\\User\\my_pathetic_python\\20240925CNNautoencoder\\data\\cat\\double\\class1')
+
+# Combine datasets
+combined_dataset = torch.utils.data.ConcatDataset([class0_dataset, class1_dataset])
+dataloader = DataLoader(combined_dataset, batch_size=16, shuffle=True)
+
+# Initialize the autoencoder
+autoencoder = Autoencoder()
+
+# Loss function and optimizer
+criterion = nn.BCELoss()
+optimizer = optim.Adam(autoencoder.parameters(), lr=0.0001)
+
+# Training loop
+num_epochs = 100
+for epoch in range(num_epochs):
+    for data in dataloader:
+        # Forward pass
+        outputs = autoencoder(data)
+        loss = criterion(outputs, data)
+        
+        # Backward pass and optimization
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    
+    # Print loss at the end of each epoch
+    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}')
+
+# Save the trained model
+torch.save(autoencoder.state_dict(), 'autoencoder0925.pth')
+
+# Load the trained model
+autoencoder = Autoencoder()
+autoencoder.load_state_dict(torch.load('autoencoder0925.pth'))
+autoencoder.eval()
+
+# Load new images to classify
+classification_folder = 'C:\\Users\\User\\my_pathetic_python\\20240925CNNautoencoder\\data\\cat\\double\\classification'
+classification_dataset = ImageDataset(classification_folder)
+classification_dataloader = DataLoader(classification_dataset, batch_size=1, shuffle=False)
+
+# Function to calculate reconstruction error
+def calculate_reconstruction_error(original, reconstructed):
+    return np.mean((original - reconstructed) ** 2)
+
+# Calculate reconstruction errors on validation set
+validation_dataloader = DataLoader(combined_dataset, batch_size=1, shuffle=False)
+validation_errors_class0 = []
+validation_errors_class1 = []
+
+
+for i, data in enumerate(validation_dataloader):
+    outputs = autoencoder(data)
+    original = data.numpy()
+    reconstructed = outputs.detach().numpy()
+    error = calculate_reconstruction_error(original, reconstructed)
+    if i < len(class0_dataset):
+        validation_errors_class0.append(error)
+    else:
+        validation_errors_class1.append(error)
+
+
+# Determine threshold based on validation errors
+validation_errors = validation_errors_class0 + validation_errors_class1
+validation_errors_class0_mean = np.mean(validation_errors_class0)
+validation_errors_class1_mean = np.mean(validation_errors_class1)
+print('class0error',validation_errors_class0_mean)
+print('class1error',validation_errors_class1_mean)
+threshold = np.mean(validation_errors)
+print('threshold',threshold)
+
+# Calculate reconstruction errors for classification images
+classification_errors = []
+for data in classification_dataloader:
+    outputs = autoencoder(data)
+    original = data.numpy()
+    reconstructed = outputs.detach().numpy()
+    error = calculate_reconstruction_error(original, reconstructed)
+    classification_errors.append(error)
+
+if validation_errors_class0_mean < validation_errors_class1_mean:
+    classification_predictions = [0 if error < threshold else 1 for error in classification_errors]
+else:
+    classification_predictions = [0 if error > threshold else 1 for error in classification_errors]
+
+# Generate dummy labels for illustration purposes (replace with actual labels)
+true_labels = [1,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0]
+
+# Print predictions and accuracy
+print("Classification Predictions:", classification_predictions)
+print("Classification True_lables:", true_labels)
+accuracy = accuracy_score(true_labels, classification_predictions)
+print(f'Accuracy: {accuracy * 100:.2f}%')
+
+# Detailed classification report
+print(classification_report(true_labels, classification_predictions, target_names=['Class 0', 'Class 1']))
+
+# Plot reconstruction errors
+plt.figure(figsize=(10, 5))
+plt.hist([error for error, label in zip(classification_errors, true_labels) if label == 0], bins=30, alpha=0.5, label='Class 0')
+plt.hist([error for error, label in zip(classification_errors, true_labels) if label == 1], bins=30, alpha=0.5, label='Class 1')
+plt.axvline(threshold, color='r', linestyle='dashed', linewidth=2, label='Threshold')
+plt.xlabel('Reconstruction Error')
+plt.ylabel('Frequency')
+plt.legend()
+plt.show()
